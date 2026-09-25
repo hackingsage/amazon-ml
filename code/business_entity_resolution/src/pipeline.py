@@ -15,6 +15,7 @@ Modes:
 """
 
 import argparse
+import gc
 import logging
 import os
 import sys
@@ -352,6 +353,11 @@ def run_test_pipeline(
             val_ground_truth=val_gt,
             model_save_path=model_path,
         )
+        # Immediately free training data to reclaim memory before loading test data
+        del train_features, train_labels, train_pair_ids, train_candidates, s23_train, s1_train
+        if val_features is not None:
+            del val_features, val_labels_arr, val_pair_ids
+        gc.collect()
     else:
         # Load pre-trained model
         model_path = os.path.join(model_dir, "lightgbm_model.txt")
@@ -448,8 +454,8 @@ def main():
     parser.add_argument("--output-dir", default="output", help="Path to output directory")
     parser.add_argument("--model-dir", default="code/business_entity_resolution/models", help="Path to model directory")
     parser.add_argument("--val-fraction", type=float, default=0.2, help="Validation split fraction (train mode)")
-    parser.add_argument("--top-k", type=int, default=30, help="Top-K for TF-IDF blocking")
-    parser.add_argument("--max-block-size", type=int, default=500, help="Max block size for token blocking")
+    parser.add_argument("--top-k", type=int, default=50, help="Top-K for TF-IDF blocking")
+    parser.add_argument("--max-block-size", type=int, default=1000, help="Max block size for token blocking")
     parser.add_argument("--log-file", default=None, help="Log file path (optional)")
     
     args = parser.parse_args()
@@ -473,8 +479,10 @@ def main():
             top_k=args.top_k,
             max_block_size=args.max_block_size,
         )
+        gc.collect()
     
     if args.mode in ("test", "both"):
+        # If mode was 'both', the model is already trained and saved by run_training_pipeline
         run_test_pipeline(
             data_dir=args.test_data,
             train_data_dir=args.train_data,
@@ -482,7 +490,7 @@ def main():
             model_dir=args.model_dir,
             top_k=args.top_k,
             max_block_size=args.max_block_size,
-            retrain=(args.mode == "both"),
+            retrain=False if args.mode == "both" else True,
             train_val_fraction=0.1 if args.mode == "both" else 0.0,
         )
 

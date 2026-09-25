@@ -17,6 +17,7 @@ Strategy B: TF-IDF character n-gram blocking
 Final candidate set = A ∪ B.
 """
 
+import gc
 import logging
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
@@ -119,14 +120,24 @@ def token_blocking(
 def tfidf_blocking(
     s1_df: pd.DataFrame,
     s23_df: pd.DataFrame,
-    top_k: int = 30,
+    top_k: int = 50,
     ngram_range: Tuple[int, int] = (3, 4),
-    min_df: int = 2,
+    min_df: int = 3,
     max_df: float = 0.8,
+    max_features: int = 400000,
+    batch_size: int = 1000,
 ) -> Dict[str, Set[str]]:
     """
     TF-IDF character n-gram blocking: for each S1 entity, retrieve the top-K
     most similar S2/S3 entities by cosine similarity on character n-grams.
+    
+    Calibrated for a ~28-30 GB RAM budget (utilizing available 32 GB system memory):
+      - Uses (3, 4)-grams with max_features=400,000 for maximum fine-grained vocabulary
+      - min_df=3 captures low-frequency entity terms and domain-specific words
+      - top_k=50 boosts candidate recall ceiling
+      - batch_size=1000 maximizes multi-threaded matrix multiplication throughput
+      - Direct sparse CSR slicing avoids allocating dense arrays during top-k selection
+      - Explicit garbage collection frees intermediate matrices
     
     Args:
         s1_df: Source 1 dataframe.
@@ -135,6 +146,8 @@ def tfidf_blocking(
         ngram_range: Character n-gram range for TF-IDF.
         min_df: Minimum document frequency for TF-IDF terms.
         max_df: Maximum document frequency fraction for TF-IDF terms.
+        max_features: Maximum vocabulary size to prevent OOM.
+        batch_size: Batch size for cosine similarity matrix multiplication.
     
     Returns:
         Dict mapping S1 entity_id → set of candidate S2/S3 entity_ids.
@@ -170,12 +183,19 @@ def tfidf_blocking(
         ngram_range=ngram_range,
         min_df=min_df,
         max_df=max_df,
+        max_features=max_features,
         sublinear_tf=True,
         dtype=np.float32,
     )
     
-    logger.info(f"  Fitting TF-IDF on {len(all_texts)} documents (ngram_range={ngram_range})...")
+    logger.info(
+        f"  Fitting TF-IDF on {len(all_texts)} documents "
+        f"(ngram_range={ngram_range}, max_features={max_features}, min_df={min_df})..."
+    )
     all_tfidf = vectorizer.fit_transform(all_texts)
+    
+    del all_texts
+    gc.collect()
     
     s1_tfidf = all_tfidf[:len(s1_texts)]
     s23_tfidf = all_tfidf[len(s1_texts):]
@@ -185,7 +205,6 @@ def tfidf_blocking(
     # Compute top-K for each S1 entity using sparse dot product
     # We do this in batches to manage memory
     candidates: Dict[str, Set[str]] = {}
-    batch_size = 500
     
     s23_tfidf_T = s23_tfidf.T.tocsc()  # transpose for fast column access
     
@@ -193,31 +212,38 @@ def tfidf_blocking(
         batch_end = min(batch_start + batch_size, len(s1_ids))
         batch_tfidf = s1_tfidf[batch_start:batch_end]
         
-        # Cosine similarity = dot product (vectors are already L2-normalized by TF-IDF)
-        # Actually TfidfVectorizer with sublinear_tf doesn't L2-normalize by default...
-        # but the default norm='l2' does normalize. So dot product = cosine similarity.
+        # Cosine similarity = dot product (vectors are already L2-normalized by default norm='l2')
         sim_matrix = batch_tfidf.dot(s23_tfidf_T)
+        
+        # Fast direct sparse CSR extraction (avoids allocating 1M+ dense float arrays)
+        indptr = sim_matrix.indptr
+        indices = sim_matrix.indices
+        data = sim_matrix.data
         
         for i in range(batch_end - batch_start):
             s1_id = s1_ids[batch_start + i]
-            row = sim_matrix[i]
+            row_start = indptr[i]
+            row_end = indptr[i + 1]
+            row_len = row_end - row_start
             
-            if hasattr(row, 'toarray'):
-                row_dense = row.toarray().flatten()
+            if row_len == 0:
+                candidates[s1_id] = set()
+                continue
+            
+            row_data = data[row_start:row_end]
+            row_indices = indices[row_start:row_end]
+            
+            if row_len <= top_k:
+                top_indices = row_indices[row_data > 0]
             else:
-                row_dense = np.asarray(row).flatten()
-            
-            # Get top-K indices
-            if len(row_dense) <= top_k:
-                top_indices = np.arange(len(row_dense))
-            else:
-                # Partial sort for efficiency
-                top_indices = np.argpartition(row_dense, -top_k)[-top_k:]
-            
-            # Filter to only those with positive similarity
-            top_indices = [idx for idx in top_indices if row_dense[idx] > 0]
+                part = np.argpartition(row_data, -top_k)[-top_k:]
+                part = part[row_data[part] > 0]
+                top_indices = row_indices[part]
             
             candidates[s1_id] = {s23_ids[idx] for idx in top_indices}
+    
+    del all_tfidf, s1_tfidf, s23_tfidf, s23_tfidf_T
+    gc.collect()
     
     total_pairs = sum(len(v) for v in candidates.values())
     logger.info(f"  TF-IDF blocking: {len(candidates)} S1 entities → {total_pairs} total candidate pairs (top_k={top_k})")
@@ -231,8 +257,11 @@ def tfidf_blocking(
 def union_blocking(
     s1_df: pd.DataFrame,
     s23_df: pd.DataFrame,
-    top_k: int = 30,
-    max_block_size: int = 500,
+    top_k: int = 50,
+    max_block_size: int = 1000,
+    tfidf_max_features: int = 400000,
+    tfidf_min_df: int = 3,
+    tfidf_ngram_range: Tuple[int, int] = (3, 4),
 ) -> Dict[str, Set[str]]:
     """
     Union of token-based + TF-IDF blocking. Maximizes recall ceiling.
@@ -242,6 +271,9 @@ def union_blocking(
         s23_df: Combined Source 2 + Source 3 dataframe.
         top_k: Top-K for TF-IDF blocking.
         max_block_size: Max block size for token blocking.
+        tfidf_max_features: Cap on TF-IDF features to fit within RAM budget.
+        tfidf_min_df: Min doc frequency for TF-IDF terms.
+        tfidf_ngram_range: N-gram range for TF-IDF.
     
     Returns:
         Dict mapping S1 entity_id → set of candidate S2/S3 entity_ids.
@@ -251,7 +283,14 @@ def union_blocking(
     logger.info("=" * 60)
     
     token_cands = token_blocking(s1_df, s23_df, max_block_size=max_block_size)
-    tfidf_cands = tfidf_blocking(s1_df, s23_df, top_k=top_k)
+    tfidf_cands = tfidf_blocking(
+        s1_df,
+        s23_df,
+        top_k=top_k,
+        ngram_range=tfidf_ngram_range,
+        max_features=tfidf_max_features,
+        min_df=tfidf_min_df,
+    )
     
     # Union
     all_s1_ids = set(s1_df["entity_id"].tolist())

@@ -9,6 +9,7 @@ Computes ~30 features for each (S1 entity, S2/S3 entity) pair covering:
   - Length ratios
 """
 
+import gc
 import logging
 from typing import Dict, List, Optional, Tuple
 
@@ -358,6 +359,14 @@ def compute_features_for_pairs(
     
     if all_features:
         feature_df = pd.DataFrame(all_features)
+        del all_features
+        gc.collect()
+
+        # Downcast float64 columns to float32 to reduce memory by 50%
+        float_cols = feature_df.select_dtypes(include=["float64"]).columns
+        if len(float_cols) > 0:
+            feature_df[float_cols] = feature_df[float_cols].astype(np.float32)
+
         FEATURE_NAMES = list(feature_df.columns)
         logger.info(f"  Feature matrix shape: {feature_df.shape}")
         logger.info(f"  Features: {FEATURE_NAMES}")
