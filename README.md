@@ -108,7 +108,20 @@ flowchart TD
 
 ## 🛠️ Quickstart
 
-### 1. Environment Setup
+### ⚡ One-Click Execution (All Prerequisites + Pipeline)
+
+You can run everything—dependency checks, unit tests, dataset verification, training, inference, and submission validation—in a single command:
+
+```bash
+python run_all.py
+```
+*(On Windows PowerShell, you can also run `.\run.ps1`; on Command Prompt: `run.bat`; on Linux/macOS: `./run.sh`)*
+
+---
+
+### Step-by-Step Execution
+
+#### 1. Environment Setup
 
 Clone the repository and install dependencies:
 
