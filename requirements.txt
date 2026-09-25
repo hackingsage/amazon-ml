@@ -1,0 +1,8 @@
+# Business Entity Resolution Pipeline - Dependencies
+# Python 3.10+ (tested on Python 3.13)
+
+pandas>=2.2.0
+numpy>=2.2.0
+scipy>=1.15.0
+scikit-learn>=1.6.0
+lightgbm>=4.6.0
