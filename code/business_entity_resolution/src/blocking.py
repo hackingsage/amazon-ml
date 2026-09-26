@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
 
 from .normalization import (
     get_combined_text,
@@ -51,10 +52,12 @@ def _build_inverted_index(
     Blocking keys are (country, name_token) tuples stringified.
     """
     index: Dict[str, Set[str]] = defaultdict(set)
-    for _, row in df.iterrows():
-        eid = row[id_col]
-        country = normalize_country(row.get(country_col, ""))
-        name_tokens = get_name_tokens_for_blocking(str(row.get(name_col, "")))
+    ids = df[id_col].tolist()
+    countries = df[country_col].tolist() if country_col in df.columns else [""] * len(df)
+    names = df[name_col].tolist() if name_col in df.columns else [""] * len(df)
+    for eid, country_raw, name_raw in zip(ids, countries, names):
+        country = normalize_country(country_raw)
+        name_tokens = get_name_tokens_for_blocking(str(name_raw))
         for token in name_tokens:
             # Key = country + token (compound key for selectivity)
             key = f"{country}|{token}"
@@ -90,10 +93,13 @@ def token_blocking(
     logger.info(f"  S2/S3 index: {len(s23_index)} blocking keys (after filtering blocks > {max_block_size})")
     
     candidates: Dict[str, Set[str]] = {}
-    for _, row in s1_df.iterrows():
-        eid = row["entity_id"]
-        country = normalize_country(row.get("country", ""))
-        name_tokens = get_name_tokens_for_blocking(str(row.get("business_name", "")))
+    s1_ids = s1_df["entity_id"].tolist()
+    s1_countries = s1_df["country"].tolist() if "country" in s1_df.columns else [""] * len(s1_df)
+    s1_names = s1_df["business_name"].tolist() if "business_name" in s1_df.columns else [""] * len(s1_df)
+
+    for eid, country_raw, name_raw in zip(s1_ids, s1_countries, s1_names):
+        country = normalize_country(country_raw)
+        name_tokens = get_name_tokens_for_blocking(str(name_raw))
         
         cands: Set[str] = set()
         for token in name_tokens:
@@ -155,25 +161,25 @@ def tfidf_blocking(
     logger.info("Building TF-IDF character n-gram blocking...")
     
     # Build combined text for all records
-    s1_texts = []
-    s1_ids = []
-    for _, row in s1_df.iterrows():
-        s1_ids.append(row["entity_id"])
-        s1_texts.append(get_combined_text(
-            str(row.get("business_name", "")),
-            str(row.get("business_address", "")),
-            str(row.get("country", "")),
-        ))
-    
-    s23_texts = []
-    s23_ids = []
-    for _, row in s23_df.iterrows():
-        s23_ids.append(row["entity_id"])
-        s23_texts.append(get_combined_text(
-            str(row.get("business_name", "")),
-            str(row.get("business_address", "")),
-            str(row.get("country", "")),
-        ))
+    def _cols(df: pd.DataFrame) -> Tuple[list, list, list, list]:
+        n = len(df)
+        ids = df["entity_id"].tolist()
+        names = df["business_name"].tolist() if "business_name" in df.columns else [""] * n
+        addrs = df["business_address"].tolist() if "business_address" in df.columns else [""] * n
+        countries = df["country"].tolist() if "country" in df.columns else [""] * n
+        return ids, names, addrs, countries
+
+    s1_ids, s1_names, s1_addrs, s1_countries = _cols(s1_df)
+    s1_texts = [
+        get_combined_text(str(name), str(addr), str(country))
+        for name, addr, country in zip(s1_names, s1_addrs, s1_countries)
+    ]
+
+    s23_ids, s23_names, s23_addrs, s23_countries = _cols(s23_df)
+    s23_texts = [
+        get_combined_text(str(name), str(addr), str(country))
+        for name, addr, country in zip(s23_names, s23_addrs, s23_countries)
+    ]
     
     # Fit TF-IDF on all texts jointly for consistent vocabulary
     all_texts = s1_texts + s23_texts
@@ -201,48 +207,76 @@ def tfidf_blocking(
     s23_tfidf = all_tfidf[len(s1_texts):]
     
     logger.info(f"  TF-IDF matrix: {all_tfidf.shape[0]} docs × {all_tfidf.shape[1]} features")
-    
-    # Compute top-K for each S1 entity using sparse dot product
-    # We do this in batches to manage memory
+    logger.info(f"  S1 nnz: {s1_tfidf.nnz:,}  S23 nnz: {s23_tfidf.nnz:,}")
+
+    del all_tfidf
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # Top-K similarity search WITHOUT ever materializing a dense (or
+    # near-dense) batch × N_s23 similarity matrix.
+    #
+    # The previous implementation computed `batch_tfidf.dot(s23_tfidf_T)`
+    # directly. With char_wb (3,4)-grams, most documents share at least
+    # one n-gram with most other documents, so this product is nowhere
+    # near sparse at scale — on 10M+ records it produces billions of
+    # non-zero entries and blows past available RAM
+    # (numpy._core._exceptions._ArrayMemoryError).
+    #
+    # sklearn's NearestNeighbors(metric="cosine", algorithm="brute") still
+    # does an exact sparse dot product under the hood, but it processes
+    # the query matrix in small internal chunks and only keeps the top_k
+    # result per row instead of the full similarity matrix, so memory
+    # stays bounded by (chunk_size × N_s23) intermediate math, not by the
+    # number of non-zero *matches* across the whole dataset.
+    # ------------------------------------------------------------------
     candidates: Dict[str, Set[str]] = {}
-    
-    s23_tfidf_T = s23_tfidf.T.tocsc()  # transpose for fast column access
-    
-    for batch_start in range(0, len(s1_ids), batch_size):
-        batch_end = min(batch_start + batch_size, len(s1_ids))
+
+    n_s23 = s23_tfidf.shape[0]
+    effective_top_k = min(top_k, n_s23)
+
+    logger.info(
+        f"  Running nearest-neighbor top-{effective_top_k} search "
+        f"(cosine, sparse, memory-bounded)..."
+    )
+
+    nn = NearestNeighbors(
+        n_neighbors=effective_top_k,
+        metric="cosine",
+        algorithm="brute",  # required for sparse input; still avoids full matrix materialization
+        n_jobs=-1,
+    )
+    nn.fit(s23_tfidf)
+
+    # sklearn chunks internally (see sklearn.metrics.pairwise_distances_chunked),
+    # but we still query in batches ourselves so we can log progress and so a
+    # single call never has to hold results for the entire S1 set at once.
+    query_batch_size = max(1, min(batch_size, len(s1_ids)))
+
+    for batch_start in range(0, len(s1_ids), query_batch_size):
+        batch_end = min(batch_start + query_batch_size, len(s1_ids))
         batch_tfidf = s1_tfidf[batch_start:batch_end]
-        
-        # Cosine similarity = dot product (vectors are already L2-normalized by default norm='l2')
-        sim_matrix = batch_tfidf.dot(s23_tfidf_T)
-        
-        # Fast direct sparse CSR extraction (avoids allocating 1M+ dense float arrays)
-        indptr = sim_matrix.indptr
-        indices = sim_matrix.indices
-        data = sim_matrix.data
-        
+
+        # distances are cosine distance = 1 - cosine similarity
+        distances, indices = nn.kneighbors(batch_tfidf, n_neighbors=effective_top_k)
+
         for i in range(batch_end - batch_start):
             s1_id = s1_ids[batch_start + i]
-            row_start = indptr[i]
-            row_end = indptr[i + 1]
-            row_len = row_end - row_start
-            
-            if row_len == 0:
-                candidates[s1_id] = set()
-                continue
-            
-            row_data = data[row_start:row_end]
-            row_indices = indices[row_start:row_end]
-            
-            if row_len <= top_k:
-                top_indices = row_indices[row_data > 0]
-            else:
-                part = np.argpartition(row_data, -top_k)[-top_k:]
-                part = part[row_data[part] > 0]
-                top_indices = row_indices[part]
-            
+            row_dist = distances[i]
+            row_idx = indices[i]
+
+            # Keep only genuine matches (similarity > 0, i.e. distance < 1).
+            # NearestNeighbors always returns exactly top_k neighbors even
+            # when similarity is 0, so we filter those out here.
+            mask = row_dist < 1.0
+            top_indices = row_idx[mask]
+
             candidates[s1_id] = {s23_ids[idx] for idx in top_indices}
-    
-    del all_tfidf, s1_tfidf, s23_tfidf, s23_tfidf_T
+
+        if (batch_start // query_batch_size) % 10 == 0:
+            logger.info(f"  Queried {batch_end}/{len(s1_ids)} S1 entities...")
+
+    del s1_tfidf, s23_tfidf, nn
     gc.collect()
     
     total_pairs = sum(len(v) for v in candidates.values())

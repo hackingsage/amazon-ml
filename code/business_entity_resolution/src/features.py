@@ -11,6 +11,8 @@ Computes ~30 features for each (S1 entity, S2/S3 entity) pair covering:
 
 import gc
 import logging
+import os
+from multiprocessing import get_context
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -306,23 +308,75 @@ def compute_pair_features(
 FEATURE_NAMES: Optional[List[str]] = None  # set after first call
 
 
+# ---------------------------------------------------------------------------
+# Multiprocessing worker infrastructure
+# ---------------------------------------------------------------------------
+# Each worker process gets its own copy of the s1/s23 lookups via the pool
+# initializer, so we avoid re-pickling these (potentially large) dicts on
+# every task and avoid passing them through the task queue repeatedly.
+
+_WORKER_S1_LOOKUP: Optional[Dict[str, dict]] = None
+_WORKER_S23_LOOKUP: Optional[Dict[str, dict]] = None
+
+
+def _init_worker(s1_lookup: Dict[str, dict], s23_lookup: Dict[str, dict]) -> None:
+    """Pool initializer: stash the lookups in this worker's globals once."""
+    global _WORKER_S1_LOOKUP, _WORKER_S23_LOOKUP
+    _WORKER_S1_LOOKUP = s1_lookup
+    _WORKER_S23_LOOKUP = s23_lookup
+
+
+def _compute_features_chunk(
+    chunk: List[Tuple[str, str]],
+) -> Tuple[List[Dict[str, float]], List[Tuple[str, str]]]:
+    """
+    Worker function: compute features for a chunk of (s1_id, s23_id) pairs
+    using the lookups stashed in this process by _init_worker.
+    """
+    s1_lookup = _WORKER_S1_LOOKUP
+    s23_lookup = _WORKER_S23_LOOKUP
+
+    feats_out: List[Dict[str, float]] = []
+    ids_out: List[Tuple[str, str]] = []
+
+    for s1_id, s23_id in chunk:
+        s1_row = s1_lookup.get(s1_id)
+        s23_row = s23_lookup.get(s23_id)
+        if s1_row is None or s23_row is None:
+            continue
+        feats_out.append(compute_pair_features(s1_row, s23_row))
+        ids_out.append((s1_id, s23_id))
+
+    return feats_out, ids_out
+
+
+def _chunk_list(items: List, n_chunks: int) -> List[List]:
+    """Split items into n_chunks roughly equal-sized chunks."""
+    if n_chunks <= 0:
+        n_chunks = 1
+    chunk_size = max(1, (len(items) + n_chunks - 1) // n_chunks)
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
 def compute_features_for_pairs(
     s1_df: pd.DataFrame,
     s23_df: pd.DataFrame,
     candidate_pairs: Dict[str, set],
+    n_workers: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, List[Tuple[str, str]]]:
     """
-    Compute features for all candidate pairs.
+    Compute features for all candidate pairs, in parallel across CPU cores.
     
     Args:
         s1_df: Source 1 dataframe.
         s23_df: Combined Source 2 + Source 3 dataframe.
         candidate_pairs: S1 entity_id → set of candidate S2/S3 entity_ids.
+        n_workers: Number of worker processes. Defaults to os.cpu_count().
     
     Returns:
         (feature_matrix_df, pair_ids) where:
           - feature_matrix_df: DataFrame with one row per pair, columns = feature names
-          - pair_ids: list of (s1_id, s23_id) tuples in same order
+          - pair_ids: list of (s1_id, s23_id) tuples, matching feature_matrix_df row order
     """
     global FEATURE_NAMES
     
@@ -332,30 +386,59 @@ def compute_features_for_pairs(
     s1_lookup = {row["entity_id"]: row.to_dict() for _, row in s1_df.iterrows()}
     s23_lookup = {row["entity_id"]: row.to_dict() for _, row in s23_df.iterrows()}
     
-    all_features = []
-    pair_ids = []
-    
-    total_pairs = sum(len(v) for v in candidate_pairs.items())
+    # Flatten candidate_pairs into a single list of (s1_id, s23_id) tuples up front,
+    # so we can chunk it evenly across worker processes.
+    flat_pairs: List[Tuple[str, str]] = [
+        (s1_id, s23_id)
+        for s1_id, cand_ids in candidate_pairs.items()
+        for s23_id in cand_ids
+    ]
+    total_pairs = len(flat_pairs)
     logger.info(f"  Total pairs to compute features for: {total_pairs}")
     
-    processed = 0
-    for s1_id, cand_ids in candidate_pairs.items():
-        s1_row = s1_lookup.get(s1_id)
-        if s1_row is None:
-            continue
-        
-        for s23_id in cand_ids:
-            s23_row = s23_lookup.get(s23_id)
-            if s23_row is None:
-                continue
-            
-            feats = compute_pair_features(s1_row, s23_row)
-            all_features.append(feats)
-            pair_ids.append((s1_id, s23_id))
-            
-            processed += 1
-            if processed % 10000 == 0:
-                logger.info(f"  Processed {processed}/{total_pairs} pairs...")
+    if total_pairs == 0:
+        logger.warning("  No features computed — empty candidate set!")
+        return pd.DataFrame(), []
+    
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+    # Don't spin up more workers than there are pairs, and skip the pool
+    # entirely for tiny inputs where process startup would dominate.
+    n_workers = max(1, min(n_workers, total_pairs))
+    
+    all_features: List[Dict[str, float]] = []
+    pair_ids: List[Tuple[str, str]] = []
+    
+    if n_workers == 1:
+        chunks = [flat_pairs]
+    else:
+        chunks = _chunk_list(flat_pairs, n_workers)
+    
+    logger.info(f"  Dispatching {len(chunks)} chunk(s) across {n_workers} worker process(es)...")
+    
+    if n_workers == 1:
+        # Single-process path: run directly, no pool overhead.
+        _init_worker(s1_lookup, s23_lookup)
+        for chunk in chunks:
+            feats_out, ids_out = _compute_features_chunk(chunk)
+            all_features.extend(feats_out)
+            pair_ids.extend(ids_out)
+    else:
+        ctx = get_context("spawn")
+        with ctx.Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(s1_lookup, s23_lookup),
+        ) as pool:
+            completed = 0
+            for feats_out, ids_out in pool.imap_unordered(_compute_features_chunk, chunks):
+                all_features.extend(feats_out)
+                pair_ids.extend(ids_out)
+                completed += 1
+                logger.info(
+                    f"  Completed chunk {completed}/{len(chunks)} "
+                    f"({len(pair_ids)}/{total_pairs} pairs so far)..."
+                )
     
     if all_features:
         feature_df = pd.DataFrame(all_features)
