@@ -19,6 +19,7 @@ Final candidate set = A ∪ B.
 
 import gc
 import logging
+import time
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 
@@ -26,7 +27,6 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
 
 from .normalization import (
     get_combined_text,
@@ -132,19 +132,36 @@ def tfidf_blocking(
     max_df: float = 0.8,
     max_features: int = 400000,
     batch_size: int = 1000,
+    max_terms_per_doc: int = 30,
+    max_posting_list_size: int = 2000,
+    max_candidate_pool_size: int = 3000,
 ) -> Dict[str, Set[str]]:
     """
     TF-IDF character n-gram blocking: for each S1 entity, retrieve the top-K
     most similar S2/S3 entities by cosine similarity on character n-grams.
-    
-    Calibrated for a ~28-30 GB RAM budget (utilizing available 32 GB system memory):
-      - Uses (3, 4)-grams with max_features=400,000 for maximum fine-grained vocabulary
-      - min_df=3 captures low-frequency entity terms and domain-specific words
-      - top_k=50 boosts candidate recall ceiling
-      - batch_size=1000 maximizes multi-threaded matrix multiplication throughput
-      - Direct sparse CSR slicing avoids allocating dense arrays during top-k selection
-      - Explicit garbage collection frees intermediate matrices
-    
+
+    SPEED NOTE: exact brute-force cosine against the full S2/S3 corpus is
+    O(n_s1 * n_s23) sparse work. At S2/S3 corpus sizes in the tens of
+    millions this is simply too slow (hundreds of hours), no matter how well
+    the matmul itself is parallelized. So instead of comparing every S1 row
+    against every S23 row, we use an inverted index over TF-IDF terms to
+    pre-filter each query down to a small candidate set (the S23 docs that
+    actually share a distinctive n-gram with it), and only run exact cosine
+    within that much smaller set. This is the same "reduce before you compare"
+    idea as Strategy A (token blocking), applied to the TF-IDF vocabulary:
+      1. For each S23 doc, keep only its top `max_terms_per_doc` highest-
+         weighted (most distinctive) terms, and build term -> doc postings.
+      2. Terms that appear in more than `max_posting_list_size` docs are
+         dropped from the index (they're too common to be selective, same
+         idea as `max_block_size` in token_blocking) — this bounds the
+         candidate set size per query regardless of corpus size.
+      3. For each S1 doc, look up postings for its own top terms, union
+         them into a small candidate pool, then compute exact cosine
+         similarity only against that pool and keep the top-K.
+    This turns the search from O(n_s1 * n_s23) into roughly
+    O(n_s1 * max_terms_per_doc * max_posting_list_size), independent of
+    total corpus size.
+
     Args:
         s1_df: Source 1 dataframe.
         s23_df: Combined Source 2 + Source 3 dataframe.
@@ -153,8 +170,19 @@ def tfidf_blocking(
         min_df: Minimum document frequency for TF-IDF terms.
         max_df: Maximum document frequency fraction for TF-IDF terms.
         max_features: Maximum vocabulary size to prevent OOM.
-        batch_size: Batch size for cosine similarity matrix multiplication.
-    
+        batch_size: Batch size for progress logging / chunking.
+        max_terms_per_doc: How many of each doc's highest-weighted terms to
+            index/query with. Higher = better recall, slower & more memory.
+        max_posting_list_size: Drop terms whose posting list (number of docs
+            containing them) exceeds this. Bounds worst-case candidate pool
+            size per query and keeps the index selective.
+        max_candidate_pool_size: Hard cap on how many S23 docs are gathered
+            per query before exact cosine is computed. Terms are consumed
+            rarest-first (most discriminative first), so hitting this cap
+            still keeps the most useful candidates. This is what makes
+            per-query cost bounded and independent of corpus size, even if
+            posting-list statistics are less selective than expected.
+
     Returns:
         Dict mapping S1 entity_id → set of candidate S2/S3 entity_ids.
     """
@@ -198,13 +226,16 @@ def tfidf_blocking(
         f"  Fitting TF-IDF on {len(all_texts)} documents "
         f"(ngram_range={ngram_range}, max_features={max_features}, min_df={min_df})..."
     )
+    vectorize_t0 = time.time()
     all_tfidf = vectorizer.fit_transform(all_texts)
+    vectorize_elapsed = time.time() - vectorize_t0
+    logger.info(f"  TF-IDF fit_transform took {vectorize_elapsed:.1f}s")
     
     del all_texts
     gc.collect()
     
-    s1_tfidf = all_tfidf[:len(s1_texts)]
-    s23_tfidf = all_tfidf[len(s1_texts):]
+    s1_tfidf = all_tfidf[:len(s1_texts)].tocsr()
+    s23_tfidf = all_tfidf[len(s1_texts):].tocsr()
     
     logger.info(f"  TF-IDF matrix: {all_tfidf.shape[0]} docs × {all_tfidf.shape[1]} features")
     logger.info(f"  S1 nnz: {s1_tfidf.nnz:,}  S23 nnz: {s23_tfidf.nnz:,}")
@@ -212,71 +243,178 @@ def tfidf_blocking(
     del all_tfidf
     gc.collect()
 
-    # ------------------------------------------------------------------
-    # Top-K similarity search WITHOUT ever materializing a dense (or
-    # near-dense) batch × N_s23 similarity matrix.
-    #
-    # The previous implementation computed `batch_tfidf.dot(s23_tfidf_T)`
-    # directly. With char_wb (3,4)-grams, most documents share at least
-    # one n-gram with most other documents, so this product is nowhere
-    # near sparse at scale — on 10M+ records it produces billions of
-    # non-zero entries and blows past available RAM
-    # (numpy._core._exceptions._ArrayMemoryError).
-    #
-    # sklearn's NearestNeighbors(metric="cosine", algorithm="brute") still
-    # does an exact sparse dot product under the hood, but it processes
-    # the query matrix in small internal chunks and only keeps the top_k
-    # result per row instead of the full similarity matrix, so memory
-    # stays bounded by (chunk_size × N_s23) intermediate math, not by the
-    # number of non-zero *matches* across the whole dataset.
-    # ------------------------------------------------------------------
-    candidates: Dict[str, Set[str]] = {}
+    def _fmt_duration(seconds: float) -> str:
+        if seconds < 0 or seconds != seconds:  # negative or NaN guard
+            return "unknown"
+        seconds = int(round(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h{m:02d}m{s:02d}s"
+        if m:
+            return f"{m}m{s:02d}s"
+        return f"{s}s"
+
+    def _top_terms_per_row(mat: csr_matrix, k: int) -> List[np.ndarray]:
+        """For each row, return the column indices of its top-k highest-weight
+        (most distinctive) entries. Much cheaper than using all nonzeros."""
+        indptr, indices, data = mat.indptr, mat.indices, mat.data
+        out = []
+        for i in range(mat.shape[0]):
+            start, end = indptr[i], indptr[i + 1]
+            row_len = end - start
+            if row_len == 0:
+                out.append(np.empty(0, dtype=indices.dtype))
+                continue
+            row_idx = indices[start:end]
+            row_data = data[start:end]
+            if row_len <= k:
+                out.append(row_idx)
+            else:
+                part = np.argpartition(row_data, -k)[-k:]
+                out.append(row_idx[part])
+        return out
 
     n_s23 = s23_tfidf.shape[0]
     effective_top_k = min(top_k, n_s23)
 
+    # ------------------------------------------------------------------
+    # 1. Build an inverted index over S23's most distinctive terms.
+    # ------------------------------------------------------------------
     logger.info(
-        f"  Running nearest-neighbor top-{effective_top_k} search "
-        f"(cosine, sparse, memory-bounded)..."
+        f"  Building inverted index over S2/S3 top-{max_terms_per_doc} terms/doc "
+        f"(max posting list size={max_posting_list_size:,})..."
+    )
+    index_t0 = time.time()
+
+    s23_top_terms = _top_terms_per_row(s23_tfidf, max_terms_per_doc)
+
+    term_postings: Dict[int, List[int]] = defaultdict(list)
+    for row_idx, terms in enumerate(s23_top_terms):
+        for term in terms:
+            term_postings[int(term)].append(row_idx)
+
+    # Drop overly common terms (their posting list is too big to be selective
+    # and would dominate query cost without adding precision).
+    dropped_terms = 0
+    for term in list(term_postings.keys()):
+        if len(term_postings[term]) > max_posting_list_size:
+            del term_postings[term]
+            dropped_terms += 1
+
+    index_elapsed = time.time() - index_t0
+    logger.info(
+        f"  Inverted index built in {index_elapsed:.1f}s: "
+        f"{len(term_postings):,} terms kept, {dropped_terms:,} overly common terms dropped"
     )
 
-    nn = NearestNeighbors(
-        n_neighbors=effective_top_k,
-        metric="cosine",
-        algorithm="brute",  # required for sparse input; still avoids full matrix materialization
-        n_jobs=-1,
-    )
-    nn.fit(s23_tfidf)
+    # ------------------------------------------------------------------
+    # 2. For each S1 doc, gather a small candidate pool via the inverted
+    #    index, then compute exact cosine only within that pool.
+    # ------------------------------------------------------------------
+    candidates: Dict[str, Set[str]] = {}
 
-    # sklearn chunks internally (see sklearn.metrics.pairwise_distances_chunked),
-    # but we still query in batches ourselves so we can log progress and so a
-    # single call never has to hold results for the entire S1 set at once.
+    s1_top_terms = _top_terms_per_row(s1_tfidf, max_terms_per_doc)
+
+    logger.info(f"  Querying {len(s1_ids):,} S1 entities against inverted index...")
+
+    search_t0 = time.time()
     query_batch_size = max(1, min(batch_size, len(s1_ids)))
+    n_batches = (len(s1_ids) + query_batch_size - 1) // query_batch_size
+    total_pool_size = 0
+    empty_pools = 0
 
-    for batch_start in range(0, len(s1_ids), query_batch_size):
+    for batch_idx, batch_start in enumerate(range(0, len(s1_ids), query_batch_size)):
         batch_end = min(batch_start + query_batch_size, len(s1_ids))
-        batch_tfidf = s1_tfidf[batch_start:batch_end]
+        batch_t0 = time.time()
 
-        # distances are cosine distance = 1 - cosine similarity
-        distances, indices = nn.kneighbors(batch_tfidf, n_neighbors=effective_top_k)
+        for i in range(batch_start, batch_end):
+            s1_id = s1_ids[i]
 
-        for i in range(batch_end - batch_start):
-            s1_id = s1_ids[batch_start + i]
-            row_dist = distances[i]
-            row_idx = indices[i]
+            # Gather this doc's candidate-term postings, sorted rarest-first
+            # (smallest posting list = most discriminative term). We consume
+            # terms in that order and stop once the pool hits its hard cap,
+            # so per-query cost is bounded regardless of how many moderately
+            # common terms this doc happens to have.
+            term_lists = []
+            for term in s1_top_terms[i]:
+                postings = term_postings.get(int(term))
+                if postings:
+                    term_lists.append(postings)
+            term_lists.sort(key=len)
 
-            # Keep only genuine matches (similarity > 0, i.e. distance < 1).
-            # NearestNeighbors always returns exactly top_k neighbors even
-            # when similarity is 0, so we filter those out here.
-            mask = row_dist < 1.0
-            top_indices = row_idx[mask]
+            pool_idx_set: Set[int] = set()
+            for postings in term_lists:
+                pool_idx_set.update(postings)
+                if len(pool_idx_set) >= max_candidate_pool_size:
+                    break
 
-            candidates[s1_id] = {s23_ids[idx] for idx in top_indices}
+            if not pool_idx_set:
+                candidates[s1_id] = set()
+                empty_pools += 1
+                continue
 
-        if (batch_start // query_batch_size) % 10 == 0:
-            logger.info(f"  Queried {batch_end}/{len(s1_ids)} S1 entities...")
+            if len(pool_idx_set) > max_candidate_pool_size:
+                # Trim down to the cap (union of a couple term postings can
+                # overshoot it); order doesn't matter here since we still
+                # rank by exact cosine similarity next.
+                pool_idx_set = set(list(pool_idx_set)[:max_candidate_pool_size])
 
-    del s1_tfidf, s23_tfidf, nn
+            if not pool_idx_set:
+                candidates[s1_id] = set()
+                empty_pools += 1
+                continue
+
+            pool_idx = np.fromiter(pool_idx_set, dtype=np.int64, count=len(pool_idx_set))
+            total_pool_size += len(pool_idx)
+
+            # Exact cosine similarity, but only against the small pool
+            # (vectors are L2-normalized, so dot product = cosine similarity).
+            pool_matrix = s23_tfidf[pool_idx]
+            query_vec = s1_tfidf[i]
+            sims = pool_matrix.dot(query_vec.T).toarray().ravel()
+
+            k = min(effective_top_k, len(sims))
+            if k <= 0:
+                candidates[s1_id] = set()
+                continue
+            if len(sims) <= k:
+                top_local = np.argsort(-sims)
+            else:
+                part = np.argpartition(sims, -k)[-k:]
+                top_local = part[np.argsort(-sims[part])]
+
+            top_local = top_local[sims[top_local] > 0]
+            top_global = pool_idx[top_local]
+            candidates[s1_id] = {s23_ids[idx] for idx in top_global}
+
+        batch_elapsed = time.time() - batch_t0
+        rows_done = batch_end
+        elapsed = time.time() - search_t0
+        rows_per_sec = rows_done / elapsed if elapsed > 0 else 0.0
+        remaining_rows = len(s1_ids) - rows_done
+        eta_seconds = remaining_rows / rows_per_sec if rows_per_sec > 0 else float("nan")
+
+        if batch_idx < 3 or (batch_idx % 10 == 0) or rows_done == len(s1_ids):
+            avg_pool = total_pool_size / max(rows_done - empty_pools, 1)
+            logger.info(
+                f"  [{rows_done:,}/{len(s1_ids):,}] "
+                f"batch {batch_idx + 1}/{n_batches} took {batch_elapsed:.2f}s | "
+                f"{rows_per_sec:.1f} rows/s | "
+                f"avg candidate pool {avg_pool:.0f} | "
+                f"elapsed {_fmt_duration(elapsed)} | "
+                f"ETA {_fmt_duration(eta_seconds)}"
+            )
+
+    total_search_elapsed = time.time() - search_t0
+    logger.info(
+        f"  Inverted-index search complete: {len(s1_ids):,} S1 entities "
+        f"in {_fmt_duration(total_search_elapsed)} "
+        f"({len(s1_ids) / total_search_elapsed if total_search_elapsed > 0 else 0:.1f} rows/s), "
+        f"{empty_pools:,} entities had no candidate pool"
+    )
+
+    del s1_tfidf, s23_tfidf, term_postings, s23_top_terms, s1_top_terms
     gc.collect()
     
     total_pairs = sum(len(v) for v in candidates.values())
@@ -296,6 +434,8 @@ def union_blocking(
     tfidf_max_features: int = 400000,
     tfidf_min_df: int = 3,
     tfidf_ngram_range: Tuple[int, int] = (3, 4),
+    tfidf_max_terms_per_doc: int = 15,
+    tfidf_max_posting_list_size: int = 2000,
 ) -> Dict[str, Set[str]]:
     """
     Union of token-based + TF-IDF blocking. Maximizes recall ceiling.
@@ -308,6 +448,12 @@ def union_blocking(
         tfidf_max_features: Cap on TF-IDF features to fit within RAM budget.
         tfidf_min_df: Min doc frequency for TF-IDF terms.
         tfidf_ngram_range: N-gram range for TF-IDF.
+        tfidf_max_terms_per_doc: How many top-weighted terms per doc to index/
+            query with in the inverted-index prefilter. Lower = faster, may
+            reduce recall.
+        tfidf_max_posting_list_size: Drop inverted-index terms whose posting
+            list exceeds this many docs (too common to be selective). Lower =
+            faster, smaller candidate pools, may reduce recall.
     
     Returns:
         Dict mapping S1 entity_id → set of candidate S2/S3 entity_ids.
@@ -324,6 +470,8 @@ def union_blocking(
         ngram_range=tfidf_ngram_range,
         max_features=tfidf_max_features,
         min_df=tfidf_min_df,
+        max_terms_per_doc=tfidf_max_terms_per_doc,
+        max_posting_list_size=tfidf_max_posting_list_size,
     )
     
     # Union
